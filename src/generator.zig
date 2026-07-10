@@ -113,6 +113,7 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
             } else if (is_method_result) {
                 try out.appendSlice(allocator, "        return res;\n");
             } else {
+                try out.appendSlice(allocator, "        defer res.deinit();\n");
                 try out.appendSlice(allocator, "        return res.expect(");
                 try out.appendSlice(allocator, out_type);
                 try out.appendSlice(allocator, ");\n");
