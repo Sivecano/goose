@@ -194,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
         const noti_proxy = proxy.Proxy.init(&conn, "org.freedesktop.Notifications", "/org/freedesktop/Notifications", "org.freedesktop.Notifications");
 
         const NotiProp = union(enum) { Bool: bool, String: GStr };
-        const dnd = try noti_proxy.getProperty(NotiProp, "Dnd");
+        const dnd = noti_proxy.getProperty(NotiProp, "Dnd") catch NotiProp{ .Bool = false };
         std.debug.print("Notifications Dnd: {}\n", .{dnd.Bool});
     }
 
@@ -233,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Example 7: Using Generated proxy
     {
-        var conn2 = try Connection.init(allocator, .System);
+        var conn2 = try Connection.init(allocator, .System, init.io, init.environ_map);
         defer conn2.close();
 
         const power = UPowerProxy.init(&conn2);

@@ -10,7 +10,7 @@ pub const PropertiesProxy = struct {
     }
 
     pub fn Get(self: PropertiesProxy, interface_name: GStr, property_name: GStr) !proxy.MethodResult {
-        const res = try self.inner.call("Get", .{ interface_name, property_name });
+        const res = try self.inner.call("Get", .{interface_name, property_name});
         return res;
     }
     pub fn GetAll(self: PropertiesProxy, interface_name: GStr) !proxy.MethodResult {
@@ -18,7 +18,7 @@ pub const PropertiesProxy = struct {
         return res;
     }
     pub fn Set(self: PropertiesProxy, interface_name: GStr, property_name: GStr, value: anytype) !void {
-        var res = try self.inner.call("Set", .{ interface_name, property_name, value });
+        var res = try self.inner.call("Set", .{interface_name, property_name, value});
         res.deinit();
     }
 };
@@ -32,6 +32,7 @@ pub const IntrospectableProxy = struct {
 
     pub fn Introspect(self: IntrospectableProxy) !GStr {
         var res = try self.inner.call("Introspect", .{});
+        defer res.deinit();
         return res.expect(GStr);
     }
 };
@@ -49,6 +50,7 @@ pub const PeerProxy = struct {
     }
     pub fn GetMachineId(self: PeerProxy) !GStr {
         var res = try self.inner.call("GetMachineId", .{});
+        defer res.deinit();
         return res.expect(GStr);
     }
 };
@@ -74,6 +76,8 @@ pub const UPowerProxy = struct {
     }
     pub fn GetCriticalAction(self: UPowerProxy) !GStr {
         var res = try self.inner.call("GetCriticalAction", .{});
+        defer res.deinit();
         return res.expect(GStr);
     }
 };
+
