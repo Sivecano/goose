@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/goosev2.png" alt="Goose Logo" width="200"/>
+  <img src="https://raw.github.com/luxluth/goose/master/assets/goosev2.png" alt="Goose Logo" width="200"/>
   <h1>Goose</h1>
   <p><strong>A pure Zig D-Bus implementation.</strong></p>
 </div>
