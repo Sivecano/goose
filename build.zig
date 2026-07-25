@@ -31,6 +31,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("test-app", "Run the test app");
     run_step.dependOn(&run_cmd.step);
 
+    const playground_exe = b.addExecutable(.{
+        .name = "goose-playground",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/playground.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "goose", .module = mod },
+            },
+        }),
+    });
+
+    const run_plgd_cmd = b.addRunArtifact(playground_exe);
+    run_plgd_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_plgd_cmd.addArgs(args);
+    }
+
+    const run_plgd_step = b.step("playground", "Run the playground test file");
+    run_plgd_step.dependOn(&run_plgd_cmd.step);
+
     const server_exe = b.addExecutable(.{
         .name = "goose-server-test",
         .root_module = b.createModule(.{

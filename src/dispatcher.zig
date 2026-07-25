@@ -100,14 +100,14 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                             }
                         }
 
-                        var encoder = try message.BodyEncoder.encode(conn.__allocator, Value.Dict(GStr, VariantType, std.StringHashMap(VariantType)).new(dict));
+                        var encoder = try message.BodyEncoder.encode(conn.__allocator, dict);
                         defer encoder.deinit();
                         try conn.sendReply(msg, encoder);
                     } else {
                         const VariantType = Value.Variant(PropUnion);
                         var dict = std.StringHashMap(VariantType).init(conn.__allocator);
                         defer dict.deinit();
-                        var encoder = try message.BodyEncoder.encode(conn.__allocator, Value.Dict(GStr, VariantType, std.StringHashMap(VariantType)).new(dict));
+                        var encoder = try message.BodyEncoder.encode(conn.__allocator, dict);
                         defer encoder.deinit();
                         try conn.sendReply(msg, encoder);
                     }
@@ -211,7 +211,7 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                                 try dict.put(f.name, VariantType.new(@unionInit(PropUnion, f.name, new_val)));
 
                                                 const empty_strs = [_]GStr{};
-                                                const args = .{ GStr.new(w.interface_name), Value.Dict(GStr, VariantType, std.StringHashMap(VariantType)).new(dict), Value.Array(GStr).new(&empty_strs) };
+                                                const args = .{ GStr.new(w.interface_name), dict, Value.Array(GStr).new(&empty_strs) };
 
                                                 var sig_encoder = try message.BodyEncoder.encode(conn.__allocator, args);
                                                 defer sig_encoder.deinit();

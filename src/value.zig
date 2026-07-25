@@ -47,6 +47,8 @@ pub fn dbusAlignOf(comptime T: type) usize {
     if (T == GStr or T == GPath) return 4; // 's','o'
     if (T == GSig) return 1; // 'g'
     if (T == GUFd) return 4; // 'h'
+    if (T == GVariant) return 1; // 'v'
+    if (comptime Value.isDict(T)) return 4; // 'a'
 
     return switch (@typeInfo(T)) {
         .int => |info| switch (info.bits) {
@@ -71,8 +73,12 @@ pub fn dbusAlignOf(comptime T: type) usize {
         },
         .@"union" => 1, // 'v'
         .array => 4, // 'a'
-        .pointer => 4, // 'a' (slice is encoded as array)
-        else => @compileError("Unsupported alignment type for D-Bus"),
+        .pointer => |pi| {
+            if (pi.size == .slice) return 4; // 'a'
+            if (pi.size == .one) return dbusAlignOf(pi.child);
+            @compileError("Unsupported pointer type in dbusAlignOf");
+        },
+        else => @compileError("Unsupported alignment type for D-Bus " ++ @typeName(T)),
     };
 }
 
@@ -112,8 +118,104 @@ pub const GUFd = struct {
     }
 };
 
+pub const GVariantTag = enum {
+    byte,
+    boolean,
+    int16,
+    uint16,
+    int32,
+    uint32,
+    int64,
+    uint64,
+    double,
+    ufd,
+    string,
+    object_path,
+    signature,
+
+    array,
+    tuple,
+
+    dict,
+
+    variant,
+};
+
+pub const GVariant = union(GVariantTag) {
+    byte: u8,
+    boolean: bool,
+    int16: i16,
+    uint16: u16,
+    int32: i32,
+    uint32: u32,
+    int64: i64,
+    uint64: u64,
+    double: f64,
+
+    ufd: GUFd,
+    string: GStr,
+    object_path: GPath,
+    signature: GSig,
+
+    array: []GVariant,
+    tuple: []GVariant,
+
+    dict: std.StringHashMap(GVariant),
+
+    /// Variants can nest variants
+    variant: *GVariant,
+
+    pub fn deinit(self: *GVariant, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ufd, .string, .object_path, .signature => |s| allocator.free(s),
+            .array, .tuple => |arr| {
+                for (arr) |*item| item.deinit(allocator);
+                allocator.free(arr);
+            },
+            .dict => |*map| {
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(allocator);
+                }
+                map.deinit();
+            },
+            .variant => |v| {
+                v.deinit(allocator);
+                allocator.destroy(v);
+            },
+            else => {},
+        }
+    }
+};
+
 /// Represent a dbus value
 pub const Value = struct {
+    pub fn isDict(comptime T: type) bool {
+        const info = @typeInfo(T);
+        if (info == .@"struct") {
+            if (@hasDecl(T, "KV") and @hasDecl(T, "iterator")) {
+                const kv_info = @typeInfo(T.KV);
+                if (kv_info == .@"struct" and kv_info.@"struct".fields.len == 2) {
+                    const f0 = kv_info.@"struct".fields[0];
+                    const f1 = kv_info.@"struct".fields[1];
+                    return std.mem.eql(u8, f0.name, "key") and std.mem.eql(u8, f1.name, "value");
+                }
+            }
+        }
+        return false;
+    }
+
+    pub fn dictKV(comptime T: type) struct { key: type, val: type } {
+        const fields = @typeInfo(T.KV).@"struct".fields;
+        return .{ .key = fields[0].type, .val = fields[1].type };
+    }
+
+    fn dictKeyReprLen(comptime K: type) comptime_int {
+        if (K == []const u8 or K == [:0]const u8 or K == []u8 or K == [:0]u8) return 1;
+        return reprLength(K);
+    }
+
     fn doesImplementSer(comptime T: type) bool {
         if (std.meta.hasMethod(T, "ser")) {
             const Args = std.meta.ArgsTuple(@TypeOf(T.ser));
@@ -135,7 +237,11 @@ pub const Value = struct {
             },
             else => {},
         }
-        if (T == GStr or T == GPath or T == GSig or T == GUFd) return 1;
+        if (T == GStr or T == GPath or T == GSig or T == GUFd or T == GVariant) return 1;
+        if (comptime isDict(T)) {
+            const kv = dictKV(T);
+            return 3 + dictKeyReprLen(kv.key) + reprLength(kv.val);
+        }
         switch (info) {
             .int => return 1,
             .bool => return 1,
@@ -146,16 +252,23 @@ pub const Value = struct {
             .@"struct" => |s_info| {
                 const is_dict_entry = s_info.fields.len == 2 and (std.mem.eql(u8, s_info.fields[0].name, "key") and std.mem.eql(u8, s_info.fields[1].name, "value"));
                 var len: usize = if (is_dict_entry or !s_info.is_tuple) 2 else 0;
-                inline for (s_info.fields) |field| len += reprLength(field.type);
+                inline for (s_info.fields) |field| {
+                    if (is_dict_entry and (field.type == []const u8 or field.type == [:0]const u8 or field.type == []u8 or field.type == [:0]u8) and std.mem.eql(u8, field.name, "key")) {
+                        len += 1;
+                    } else {
+                        len += reprLength(field.type);
+                    }
+                }
                 return len;
             },
             .@"union" => return 1,
             .array => |a_info| return 1 + reprLength(a_info.child),
             .pointer => |p_info| {
                 if (p_info.size == .slice) return 1 + reprLength(p_info.child);
+                if (p_info.size == .one) return reprLength(p_info.child);
                 @compileError("Unsupported pointer type");
             },
-            else => @compileError("Unsupported type for signature"),
+            else => @compileError("Unsupported type for signature " ++ @typeName(T)),
         }
     }
 
@@ -185,6 +298,23 @@ pub const Value = struct {
         } else if (T == GUFd) {
             xs[real_start] = 'h';
             return;
+        } else if (T == GVariant) {
+            xs[real_start] = 'v';
+            return;
+        } else if (comptime isDict(T)) {
+            const kv = dictKV(T);
+            xs[real_start] = 'a';
+            xs[real_start + 1] = '{';
+            xs[len - 1] = '}';
+            const k_len = dictKeyReprLen(kv.key);
+            const v_len = reprLength(kv.val);
+            if (kv.key == []const u8 or kv.key == [:0]const u8 or kv.key == []u8 or kv.key == [:0]u8) {
+                xs[real_start + 2] = 's';
+            } else {
+                getRepr(kv.key, k_len, 0, @as(*[k_len]u8, @ptrCast(xs[real_start + 2 ..][0..k_len])));
+            }
+            getRepr(kv.val, v_len, 0, @as(*[v_len]u8, @ptrCast(xs[real_start + 2 + k_len ..][0..v_len])));
+            return;
         }
 
         switch (info) {
@@ -211,9 +341,14 @@ pub const Value = struct {
                     xs[len - 1] = ')';
                 }
                 inline for (s_info.fields) |field| {
-                    const ll = reprLength(field.type);
-                    getRepr(field.type, ll, 0, @as(*[ll]u8, @ptrCast(xs[real_start..][0..ll])));
-                    real_start += ll;
+                    if (is_dict_entry and (field.type == []const u8 or field.type == [:0]const u8 or field.type == []u8 or field.type == [:0]u8) and std.mem.eql(u8, field.name, "key")) {
+                        xs[real_start] = 's';
+                        real_start += 1;
+                    } else {
+                        const ll = reprLength(field.type);
+                        getRepr(field.type, ll, 0, @as(*[ll]u8, @ptrCast(xs[real_start..][0..ll])));
+                        real_start += ll;
+                    }
                 }
             },
             .array => |a_info| {
@@ -222,9 +357,13 @@ pub const Value = struct {
                 getRepr(a_info.child, ll, 0, @as(*[ll]u8, @ptrCast(xs[real_start + 1 ..][0..ll])));
             },
             .pointer => |p_info| {
-                xs[real_start] = 'a';
-                const ll = reprLength(p_info.child);
-                getRepr(p_info.child, ll, 0, @as(*[ll]u8, @ptrCast(xs[real_start + 1 ..][0..ll])));
+                if (p_info.size == .slice) {
+                    xs[real_start] = 'a';
+                    const ll = reprLength(p_info.child);
+                    getRepr(p_info.child, ll, 0, @as(*[ll]u8, @ptrCast(xs[real_start + 1 ..][0..ll])));
+                } else if (p_info.size == .one) {
+                    getRepr(p_info.child, len, start, xs);
+                } else unreachable;
             },
             .@"union" => xs[real_start] = 'v',
             else => unreachable,
@@ -322,110 +461,6 @@ pub const Value = struct {
     }
 
     /// **CONTAINER**
-    /// Entry in a dict or map (array of key-value pairs). Type code 101 'e' is
-    /// reserved for use in bindings and implementations to represent the general
-    /// concept of a dict or dict-entry, and must not appear in signatures used on D-Bus.
-    pub fn Dict(comptime K: type, comptime V: type, comptime M: type) type {
-        const key_repr_len = reprLength(K);
-        const value_repr_len = reprLength(V);
-
-        const total_len = value_repr_len + key_repr_len + 3;
-        const repr_arr = blk: {
-            var rr = [_]u8{0} ** (total_len + 1);
-            rr[0] = 'a';
-            rr[1] = '{';
-            rr[total_len - 1] = '}';
-            rr[total_len] = 0;
-            getRepr(K, key_repr_len, 0, @as(*[key_repr_len]u8, @ptrCast(rr[2 .. key_repr_len + 2].ptr)));
-            getRepr(V, value_repr_len, 0, @as(*[value_repr_len]u8, @ptrCast(rr[key_repr_len + 2 .. (total_len - 1)].ptr)));
-            break :blk rr;
-        };
-
-        return struct {
-            pub const SIGNATURE: [:0]const u8 = repr_arr[0..total_len :0];
-            inner: M,
-            repr: []const u8,
-            const Self = @This();
-
-            pub fn init(allocator: std.mem.Allocator) Self {
-                return Self{
-                    .repr = &repr_arr,
-                    .inner = M.init(allocator),
-                };
-            }
-
-            pub fn new(inner: M) Self {
-                return Self{
-                    .repr = &repr_arr,
-                    .inner = inner,
-                };
-            }
-
-            pub fn ser(self: Self, w: *DBusWriter) !void {
-                // This is precisely: Array of dict-entry
-                // Array header (4-align)
-                try w.padTo(4);
-                const len_pos = w.buffer.items.len;
-                try w.buffer.appendNTimes(w.gpa, 0, 4);
-
-                // Elements block must start at 8 (dict-entry alignment)
-                try w.padTo(8);
-                const start_elems = w.buffer.items.len;
-
-                // Iterate entries (supports std.StringHashMap and slices of {key,value})
-                if (std.meta.hasMethod(@TypeOf(self.inner), "iterator")) {
-                    var it = self.inner.iterator();
-                    while (it.next()) |e| {
-                        try w.padTo(8); // each dict-entry
-                        try w.padTo(dbusAlignOf(K));
-                        const key = e.key_ptr.*;
-                        if (comptime K == GStr) {
-                            try w.padTo(4);
-                            try w.writeInt(u32, @intCast(key.len));
-                            try w.buffer.appendSlice(w.gpa, key);
-                            try w.buffer.append(w.gpa, 0);
-                        } else {
-                            try Serializer.trySerialize(K, key, w);
-                        }
-                        try w.padTo(dbusAlignOf(V));
-                        try Serializer.trySerialize(V, e.value_ptr.*, w);
-                    }
-                } else switch (@typeInfo(@TypeOf(self.inner))) {
-                    .pointer => |pi| {
-                        if (pi.size != .slice) return error.UnsupportedDictBacking;
-                        const Elem = pi.child;
-                        const einfo = @typeInfo(Elem);
-                        if (einfo != .@"struct") return error.UnsupportedDictBacking;
-                        inline for (einfo.@"struct".fields) |_| {} // keep einfo constexpr
-                        for (self.inner) |ev| {
-                            try w.padTo(8);
-                            const k = @field(ev, "key");
-                            const v = @field(ev, "value");
-                            try w.padTo(dbusAlignOf(K));
-                            if (comptime K == GStr) {
-                                try w.padTo(4);
-                                try w.writeInt(u32, @intCast(k.s.len));
-                                try w.buffer.appendSlice(w.gpa, k.s);
-                                try w.buffer.append(w.gpa, 0);
-                            } else {
-                                try Serializer.trySerialize(K, k, w);
-                            }
-                            try w.padTo(dbusAlignOf(V));
-                            try Serializer.trySerialize(V, v, w);
-                        }
-                    },
-                    else => return error.UnsupportedDictBacking,
-                }
-
-                // Patch array byte length
-                const arr_bytes: usize = w.buffer.items.len - start_elems;
-                if (arr_bytes > std.math.maxInt(u32)) return error.ArrayTooLarge;
-                w.writeU32At(len_pos, @intCast(arr_bytes));
-            }
-        };
-    }
-
-    /// **CONTAINER**
     /// Variant type (the type of the value is part of the value itself)
     /// Only unions are accepted
     pub fn Variant(comptime T: type) type {
@@ -489,9 +524,19 @@ pub const Value = struct {
 
             pub fn ser(self: Self, w: *DBusWriter) !void {
                 try w.padTo(8);
-                inline for (@typeInfo(S).@"struct".fields) |fld| {
+                const sinfo = @typeInfo(S).@"struct";
+                const is_dict_entry = sinfo.fields.len == 2 and (std.mem.eql(u8, sinfo.fields[0].name, "key") and std.mem.eql(u8, sinfo.fields[1].name, "value"));
+                inline for (sinfo.fields) |fld| {
                     try w.padTo(dbusAlignOf(fld.type));
-                    try Serializer.trySerialize(fld.type, @field(self.inner, fld.name), w);
+                    if (is_dict_entry and (fld.type == []const u8 or fld.type == [:0]const u8 or fld.type == []u8 or fld.type == [:0]u8) and std.mem.eql(u8, fld.name, "key")) {
+                        try w.padTo(4);
+                        const slice = @field(self.inner, fld.name);
+                        try w.writeInt(u32, @intCast(slice.len));
+                        try w.buffer.appendSlice(w.gpa, slice);
+                        try w.buffer.append(w.gpa, 0);
+                    } else {
+                        try Serializer.trySerialize(fld.type, @field(self.inner, fld.name), w);
+                    }
                 }
             }
         };
@@ -688,6 +733,41 @@ pub const Serializer = struct {
             return;
         }
 
+        if (comptime Value.isDict(T)) {
+            try w.padTo(4);
+            const len_pos = w.buffer.items.len;
+            try w.buffer.appendNTimes(w.gpa, 0, 4);
+
+            try w.padTo(8);
+            const start_elems = w.buffer.items.len;
+
+            var it = data.iterator();
+            while (it.next()) |e| {
+                try w.padTo(8); // each dict-entry
+                const key = e.key_ptr.*;
+                const val = e.value_ptr.*;
+                const kv = Value.dictKV(T);
+                const K = kv.key;
+                const V = kv.val;
+                try w.padTo(dbusAlignOf(K));
+                if (K == []const u8 or K == [:0]const u8 or K == []u8 or K == [:0]u8) {
+                    try w.padTo(4);
+                    try w.writeInt(u32, @intCast(key.len));
+                    try w.buffer.appendSlice(w.gpa, key);
+                    try w.buffer.append(w.gpa, 0);
+                } else {
+                    try Serializer.trySerialize(K, key, w);
+                }
+                try w.padTo(dbusAlignOf(V));
+                try Serializer.trySerialize(V, val, w);
+            }
+
+            const arr_bytes: usize = w.buffer.items.len - start_elems;
+            if (arr_bytes > std.math.maxInt(u32)) return error.ArrayTooLarge;
+            w.writeU32At(len_pos, @intCast(arr_bytes));
+            return;
+        }
+
         if (T == GStr) {
             try Value.String().new(data.s).ser(w);
             return;
@@ -732,6 +812,9 @@ pub const Serializer = struct {
                 if (pi.size == .slice) {
                     const Elem = pi.child;
                     try Value.Array(Elem).new(data).ser(w);
+                } else if (pi.size == .one) {
+                    const Elem = pi.child;
+                    try Serializer.trySerialize(Elem, data.*, w);
                 } else return error.UnsupportedTypeForNow;
             },
             .@"struct" => |sinfo| {
@@ -752,6 +835,7 @@ pub const Serializer = struct {
 test "Signature Generation test" {
     const testing = std.testing;
     const allocator = std.testing.allocator;
+    _ = allocator;
     const eql = std.mem.eql;
 
     const Speed = struct {
@@ -804,6 +888,15 @@ test "Signature Generation test" {
     const va = Value.Variant(MulTup).new(.{ .threeValue = .{ 4, 4, 4 } });
     try testing.expect(eql(u8, va.repr, "v"));
 
-    const dico = Value.Dict([:0]const u8, f64, std.StringHashMap(f64)).init(allocator);
-    try testing.expect(eql(u8, dico.repr, "{sd}"));
+    const MapT = std.StringHashMap(f64);
+    const repr_len = Value.reprLength(MapT);
+    var repr_buf: [10]u8 = undefined;
+    Value.getRepr(MapT, repr_len, 0, repr_buf[0..repr_len]);
+    try testing.expect(eql(u8, repr_buf[0..repr_len], "a{sd}"));
+
+    const IntMapT = std.AutoHashMap(u32, Value.GStr);
+    const int_repr_len = Value.reprLength(IntMapT);
+    var int_repr_buf: [10]u8 = undefined;
+    Value.getRepr(IntMapT, int_repr_len, 0, int_repr_buf[0..int_repr_len]);
+    try testing.expect(eql(u8, int_repr_buf[0..int_repr_len], "a{us}"));
 }

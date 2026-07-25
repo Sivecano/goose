@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const Value = core.value.Value;
+const GVariant = core.value.GVariant;
 const DBusWriter = core.value.DBusWriter;
 const Serializer = core.value.Serializer;
 const dbusAlignOf = core.value.dbusAlignOf;
@@ -154,6 +155,45 @@ pub const BodyDecoder = struct {
     }
 
     fn readVal(self: *BodyDecoder, comptime T: type, comptime deep_copy: bool) anyerror!T {
+        if (comptime Value.isDict(T)) {
+            const byte_len = try self.readVal(u32, false);
+            self.alignTo(8);
+
+            const start_pos = self.pos;
+            if (self.pos + byte_len > self.body.len) return error.EndOfBody;
+
+            var map = T.init(self.allocator);
+            errdefer map.deinit();
+
+            while (self.pos - start_pos < byte_len) {
+                self.alignTo(8);
+                const kv = Value.dictKV(T);
+                const K = kv.key;
+                const V = kv.val;
+                const key = if (K == []const u8 or K == [:0]const u8 or K == []u8 or K == [:0]u8) blk: {
+                    if (self.pos + 4 > self.body.len) return error.EndOfBody;
+                    const len = std.mem.readInt(u32, self.body[self.pos..][0..4], self.endian);
+                    self.pos += 4;
+                    if (self.pos + len + 1 > self.body.len) return error.EndOfBody;
+                    if (self.body[self.pos + len] != 0) return error.MissingNullTerminator;
+                    const s = self.body[self.pos .. self.pos + len :0];
+                    self.pos += len + 1;
+                    if (deep_copy) {
+                        const new_s = try self.allocator.allocSentinel(u8, s.len, 0);
+                        @memcpy(new_s, s);
+                        break :blk new_s;
+                    } else {
+                        break :blk s;
+                    }
+                } else try self.readVal(K, deep_copy);
+
+                self.alignTo(dbusAlignOf(V));
+                const val = try self.readVal(V, deep_copy);
+                try map.put(key, val);
+            }
+            return map;
+        }
+
         switch (@typeInfo(T)) {
             .int => |info| {
                 const size = info.bits / 8;
@@ -219,10 +259,28 @@ pub const BodyDecoder = struct {
 
                 // Generic struct/tuple/dict-entry support
                 // DBus aligns structs and dict-entries to 8.
+                const is_dict_entry = info.fields.len == 2 and (std.mem.eql(u8, info.fields[0].name, "key") and std.mem.eql(u8, info.fields[1].name, "value"));
                 var result: T = undefined;
                 inline for (info.fields) |fld| {
                     self.alignTo(dbusAlignOf(fld.type));
-                    @field(result, fld.name) = try self.readVal(fld.type, deep_copy);
+                    if (is_dict_entry and (fld.type == []const u8 or fld.type == [:0]const u8 or fld.type == []u8 or fld.type == [:0]u8) and std.mem.eql(u8, fld.name, "key")) {
+                        if (self.pos + 4 > self.body.len) return error.EndOfBody;
+                        const len = std.mem.readInt(u32, self.body[self.pos..][0..4], self.endian);
+                        self.pos += 4;
+                        if (self.pos + len + 1 > self.body.len) return error.EndOfBody;
+                        if (self.body[self.pos + len] != 0) return error.MissingNullTerminator;
+                        const s = self.body[self.pos .. self.pos + len :0];
+                        self.pos += len + 1;
+                        if (deep_copy) {
+                            const new_s = try self.allocator.allocSentinel(u8, s.len, 0);
+                            @memcpy(new_s, s);
+                            @field(result, fld.name) = new_s;
+                        } else {
+                            @field(result, fld.name) = s;
+                        }
+                    } else {
+                        @field(result, fld.name) = try self.readVal(fld.type, deep_copy);
+                    }
                 }
                 return result;
             },
@@ -254,6 +312,10 @@ pub const BodyDecoder = struct {
                 const inner_sig_struct = try self.readVal(GSig, false); // Signature borrowed is fine here for comparison
                 const inner_sig = inner_sig_struct.s;
 
+                if (T == GVariant) {
+                    return try self.readDynamicVariant(inner_sig, deep_copy);
+                }
+
                 inline for (info.fields) |fld| {
                     const fld_sig_len = Value.reprLength(fld.type);
                     var fld_sig_buf: [256]u8 = undefined;
@@ -267,6 +329,216 @@ pub const BodyDecoder = struct {
                 return error.NoMatchingUnionField;
             },
             else => return error.UnsupportedType,
+        }
+    }
+
+    fn readDynamicVariant(self: *BodyDecoder, sig: []const u8, comptime deep_copy: bool) anyerror!GVariant {
+        var pos: usize = 0;
+        return self.readDynamicVariantInner(sig, &pos, deep_copy);
+    }
+
+    fn readDynamicVariantInner(self: *BodyDecoder, sig: []const u8, sig_pos: *usize, comptime deep_copy: bool) anyerror!GVariant {
+        if (sig_pos.* >= sig.len) return error.SignatureEnd;
+        const c = sig[sig_pos.*];
+        sig_pos.* += 1;
+        switch (c) {
+            'y' => {
+                self.alignTo(dbusAlignOf(u8));
+                return GVariant{ .byte = try self.readVal(u8, deep_copy) };
+            },
+            'b' => {
+                self.alignTo(dbusAlignOf(bool));
+                return GVariant{ .boolean = try self.readVal(bool, deep_copy) };
+            },
+            'n' => {
+                self.alignTo(dbusAlignOf(i16));
+                return GVariant{ .int16 = try self.readVal(i16, deep_copy) };
+            },
+            'q' => {
+                self.alignTo(dbusAlignOf(u16));
+                return GVariant{ .uint16 = try self.readVal(u16, deep_copy) };
+            },
+            'i' => {
+                self.alignTo(dbusAlignOf(i32));
+                return GVariant{ .int32 = try self.readVal(i32, deep_copy) };
+            },
+            'u' => {
+                self.alignTo(dbusAlignOf(u32));
+                return GVariant{ .uint32 = try self.readVal(u32, deep_copy) };
+            },
+            'x' => {
+                self.alignTo(dbusAlignOf(i64));
+                return GVariant{ .int64 = try self.readVal(i64, deep_copy) };
+            },
+            't' => {
+                self.alignTo(dbusAlignOf(u64));
+                return GVariant{ .uint64 = try self.readVal(u64, deep_copy) };
+            },
+            'd' => {
+                self.alignTo(dbusAlignOf(f64));
+                return GVariant{ .double = try self.readVal(f64, deep_copy) };
+            },
+            'h' => {
+                self.alignTo(dbusAlignOf(core.value.GUFd));
+                return GVariant{ .ufd = try self.readVal(core.value.GUFd, deep_copy) };
+            },
+            's' => {
+                self.alignTo(dbusAlignOf(core.value.GStr));
+                return GVariant{ .string = try self.readVal(core.value.GStr, deep_copy) };
+            },
+            'o' => {
+                self.alignTo(dbusAlignOf(core.value.GPath));
+                return GVariant{ .object_path = try self.readVal(core.value.GPath, deep_copy) };
+            },
+            'g' => {
+                self.alignTo(dbusAlignOf(core.value.GSig));
+                return GVariant{ .signature = try self.readVal(core.value.GSig, deep_copy) };
+            },
+            'v' => {
+                const inner_sig_struct = try self.readVal(core.value.GSig, false);
+                const inner_sig = inner_sig_struct.s;
+                const inner_v = try self.readDynamicVariant(inner_sig, deep_copy);
+                if (deep_copy) {
+                    const ptr = try self.allocator.create(GVariant);
+                    ptr.* = inner_v;
+                    return GVariant{ .variant = ptr };
+                } else {
+                    return error.VariantCannotBeBorrowed;
+                }
+            },
+            'a' => {
+                if (sig_pos.* >= sig.len) return error.SignatureEnd;
+                const is_dict = sig[sig_pos.*] == '{';
+
+                const byte_len = try self.readVal(u32, false);
+
+                if (is_dict) {
+                    self.alignTo(8);
+
+                    const start_pos = self.pos;
+                    if (self.pos + byte_len > self.body.len) return error.EndOfBody;
+
+                    if (!deep_copy) return error.DictCannotBeBorrowed;
+
+                    var dict = std.StringHashMap(GVariant).init(self.allocator);
+                    errdefer dict.deinit();
+
+                    sig_pos.* += 1;
+                    const key_type = sig[sig_pos.*];
+                    if (key_type != 's' and key_type != 'o' and key_type != 'g') {
+                        return error.UnsupportedDictKeyType;
+                    }
+
+                    const dict_entry_sig_start = sig_pos.*;
+
+                    while (self.pos - start_pos < byte_len) {
+                        self.alignTo(8);
+                        sig_pos.* = dict_entry_sig_start;
+
+                        const key_variant = try self.readDynamicVariantInner(sig, sig_pos, deep_copy);
+                        const key_str = switch (key_variant) {
+                            .string => |s| s.s,
+                            .object_path => |o| o.s,
+                            .signature => |s| s.s,
+                            else => unreachable,
+                        };
+
+                        const val_variant = try self.readDynamicVariantInner(sig, sig_pos, deep_copy);
+
+                        try dict.put(key_str, val_variant);
+
+                        if (sig[sig_pos.*] != '}') return error.ExpectedDictEnd;
+                    }
+
+                    if (byte_len == 0) {
+                        _ = try self.skipDynamicVariantInner(sig, sig_pos);
+                    } else {
+                        sig_pos.* += 1;
+                    }
+
+                    return GVariant{ .dict = dict };
+                } else {
+                    const elem_align = try self.alignOfDynamicType(sig, sig_pos.*);
+                    self.alignTo(elem_align);
+
+                    const start_pos = self.pos;
+                    if (self.pos + byte_len > self.body.len) return error.EndOfBody;
+
+                    if (!deep_copy) return error.ArrayCannotBeBorrowed;
+
+                    var list = try std.ArrayList(GVariant).initCapacity(self.allocator, 0);
+                    errdefer list.deinit(self.allocator);
+
+                    const elem_sig_start = sig_pos.*;
+
+                    while (self.pos - start_pos < byte_len) {
+                        self.alignTo(elem_align);
+                        sig_pos.* = elem_sig_start;
+                        const elem_v = try self.readDynamicVariantInner(sig, sig_pos, deep_copy);
+                        try list.append(self.allocator, elem_v);
+                    }
+
+                    if (byte_len == 0) {
+                        _ = try self.skipDynamicVariantInner(sig, sig_pos);
+                    }
+
+                    return GVariant{ .array = try list.toOwnedSlice(self.allocator) };
+                }
+            },
+            '(' => {
+                self.alignTo(8);
+                if (!deep_copy) return error.TupleCannotBeBorrowed;
+                var list = try std.ArrayList(GVariant).initCapacity(self.allocator, 0);
+                errdefer list.deinit(self.allocator);
+
+                while (sig_pos.* < sig.len and sig[sig_pos.*] != ')') {
+                    const elem_v = try self.readDynamicVariantInner(sig, sig_pos, deep_copy);
+                    try list.append(self.allocator, elem_v);
+                }
+                if (sig_pos.* >= sig.len or sig[sig_pos.*] != ')') return error.ExpectedTupleEnd;
+                sig_pos.* += 1;
+
+                return GVariant{ .tuple = try list.toOwnedSlice(self.allocator) };
+            },
+            else => return error.UnsupportedDynamicType,
+        }
+    }
+
+    fn skipDynamicVariantInner(self: *BodyDecoder, sig: []const u8, sig_pos: *usize) anyerror!void {
+        if (sig_pos.* >= sig.len) return error.SignatureEnd;
+        const c = sig[sig_pos.*];
+        sig_pos.* += 1;
+        switch (c) {
+            'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 'h', 's', 'o', 'g', 'v' => return,
+            'a' => {
+                return self.skipDynamicVariantInner(sig, sig_pos);
+            },
+            '(' => {
+                while (sig_pos.* < sig.len and sig[sig_pos.*] != ')') {
+                    try self.skipDynamicVariantInner(sig, sig_pos);
+                }
+                if (sig_pos.* >= sig.len) return error.SignatureEnd;
+                sig_pos.* += 1;
+            },
+            '{' => {
+                try self.skipDynamicVariantInner(sig, sig_pos); // key
+                try self.skipDynamicVariantInner(sig, sig_pos); // val
+                if (sig_pos.* >= sig.len or sig[sig_pos.*] != '}') return error.SignatureEnd;
+                sig_pos.* += 1;
+            },
+            else => return error.UnsupportedDynamicType,
+        }
+    }
+
+    fn alignOfDynamicType(self: *BodyDecoder, sig: []const u8, sig_pos: usize) anyerror!usize {
+        _ = self;
+        if (sig_pos >= sig.len) return error.SignatureEnd;
+        switch (sig[sig_pos]) {
+            'y', 'g', 'v' => return 1,
+            'n', 'q' => return 2,
+            'i', 'u', 'b', 'h', 'a', 's', 'o' => return 4,
+            'x', 't', 'd', '(', '{' => return 8,
+            else => return error.UnsupportedDynamicType,
         }
     }
 };
