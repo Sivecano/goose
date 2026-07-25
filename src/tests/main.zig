@@ -237,14 +237,12 @@ pub fn main(init: std.process.Init) !void {
         defer conn2.close();
 
         const power = UPowerProxy.init(&conn2);
-        var answer = try power.EnumerateDevices();
-        defer answer.deinit();
-        printData(answer.msg.body);
-        std.debug.print("{any}\n{any}\n", .{ answer.msg.header, answer.msg.body });
-        const paths = try answer.expect([]const GPath);
+        const paths = try power.EnumerateDevices();
 
         for (paths) |path| {
             std.debug.print("{s}\n", .{path.s});
+            allocator.free(path.s);
         }
+        allocator.free(paths);
     }
 }

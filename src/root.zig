@@ -19,3 +19,7 @@ pub const Access = dbus_types.Access;
 pub const Connection = @import("connection.zig").Connection;
 pub const BusType = @import("connection.zig").BusType;
 pub const SignalHandler = @import("common.zig").SignalHandler;
+
+test {
+    std.testing.refAllDecls(@This());
+}

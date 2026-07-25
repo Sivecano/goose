@@ -3,12 +3,21 @@ const introspection = @import("introspection.zig");
 
 /// Generates Zig Proxy source code from a D-Bus Node tree.
 pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[]const u8, path: ?[]const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temp_alloc = arena.allocator();
+
     var out = try std.ArrayList(u8).initCapacity(allocator, 2048);
     errdefer out.deinit(allocator);
 
+    try out.appendSlice(allocator, "const std = @import(\"std\");\n");
     try out.appendSlice(allocator, "const goose = @import(\"goose\");\n");
     try out.appendSlice(allocator, "const proxy = goose.proxy;\n");
-    try out.appendSlice(allocator, "const GStr = goose.core.value.GStr;\n\n");
+    try out.appendSlice(allocator, "const GStr = goose.core.value.GStr;\n");
+    try out.appendSlice(allocator, "const GPath = goose.core.value.GPath;\n");
+    try out.appendSlice(allocator, "const GSig = goose.core.value.GSig;\n");
+    try out.appendSlice(allocator, "const GUFd = goose.core.value.GUFd;\n");
+    try out.appendSlice(allocator, "const GVariant = goose.core.value.GVariant;\n\n");
 
     for (node.interfaces) |iface| {
         // Simple name cleaning (e.g. org.freedesktop.DBus -> DBus)
@@ -63,7 +72,7 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
                         try out.print(allocator, "arg{d}", .{in_idx});
                     }
                     try out.appendSlice(allocator, ": ");
-                    try out.appendSlice(allocator, try dbusTypeToZig(arg.type, true));
+                    try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, true));
                     in_idx += 1;
                 }
             }
@@ -77,7 +86,7 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
                 }
             }
 
-            const out_type = if (out_sig) |s| try dbusTypeToZig(s, false) else "void";
+            const out_type = if (out_sig) |s| try dbusTypeToZig(temp_alloc, s, false) else "void";
             const is_method_result = std.mem.eql(u8, out_type, "proxy.MethodResult");
 
             try out.appendSlice(allocator, ") !");
@@ -114,7 +123,7 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
                 try out.appendSlice(allocator, "        return res;\n");
             } else {
                 try out.appendSlice(allocator, "        defer res.deinit();\n");
-                try out.appendSlice(allocator, "        return res.expect(");
+                try out.appendSlice(allocator, "        return res.expectAlloc(");
                 try out.appendSlice(allocator, out_type);
                 try out.appendSlice(allocator, ");\n");
             }
@@ -127,16 +136,145 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
     return out.toOwnedSlice(allocator);
 }
 
-fn dbusTypeToZig(sig: []const u8, is_param: bool) ![]const u8 {
-    if (std.mem.eql(u8, sig, "s")) return "GStr";
-    if (std.mem.eql(u8, sig, "u")) return "u32";
-    if (std.mem.eql(u8, sig, "b")) return "bool";
-    if (std.mem.eql(u8, sig, "as")) return "[]const GStr";
-    if (std.mem.eql(u8, sig, "i")) return "i32";
-    if (std.mem.eql(u8, sig, "x")) return "i64";
-    if (std.mem.eql(u8, sig, "t")) return "u64";
-    if (std.mem.eql(u8, sig, "d")) return "f64";
+fn matchBasicType(sig: []const u8) ?[]const u8 {
+    if (sig.len != 1) return null;
+    return switch (sig[0]) {
+        'y' => "u8",
+        'b' => "bool",
+        'n' => "i16",
+        'q' => "u16",
+        'i' => "i32",
+        'u' => "u32",
+        'x' => "i64",
+        't' => "u64",
+        'd' => "f64",
+        's' => "GStr",
+        'o' => "GPath",
+        'g' => "GSig",
+        'h' => "GUFd",
+        'v' => "GVariant",
+        else => null,
+    };
+}
+
+fn nextSingleSig(sig: []const u8) ?[]const u8 {
+    if (sig.len == 0) return null;
+    switch (sig[0]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => return sig[0..1],
+        'a' => {
+            const child = nextSingleSig(sig[1..]) orelse return null;
+            return sig[0 .. 1 + child.len];
+        },
+        '(', '{' => {
+            var depth: usize = 0;
+            const open_char = sig[0];
+            const close_char: u8 = if (open_char == '(') ')' else '}';
+            for (sig, 0..) |c, idx| {
+                if (c == open_char) depth += 1;
+                if (c == close_char) {
+                    depth -= 1;
+                    if (depth == 0) {
+                        return sig[0 .. idx + 1];
+                    }
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn dbusTypeToZig(allocator: std.mem.Allocator, sig: []const u8, is_param: bool) ![]const u8 {
+    if (matchBasicType(sig)) |basic| {
+        return basic;
+    }
+
+    // Dictionaries: a{kv}
+    if (sig.len >= 4 and std.mem.startsWith(u8, sig, "a{") and sig[sig.len - 1] == '}') {
+        const key_char = sig[2];
+        const val_sig = sig[3 .. sig.len - 1];
+        const val_type = try dbusTypeToZig(allocator, val_sig, false);
+
+        const key_type = matchBasicType(sig[2..3]) orelse "u32";
+
+        if (key_char == 's' or key_char == 'o' or key_char == 'g') {
+            return try std.fmt.allocPrint(allocator, "std.StringHashMap({s})", .{val_type});
+        } else {
+            return try std.fmt.allocPrint(allocator, "std.AutoHashMap({s}, {s})", .{ key_type, val_type });
+        }
+    }
+
+    // Arrays: a... (excluding dictionaries handled above)
+    if (std.mem.startsWith(u8, sig, "a")) {
+        const child_sig = sig[1..];
+        const child_type = try dbusTypeToZig(allocator, child_sig, false);
+        if (std.mem.eql(u8, child_type, "proxy.MethodResult") or std.mem.eql(u8, child_type, "anytype")) {
+            if (is_param) return "anytype";
+            return "proxy.MethodResult";
+        }
+        return try std.fmt.allocPrint(allocator, "[]const {s}", .{child_type});
+    }
+
+    // Structs / Tuples: (...)
+    if (sig.len >= 2 and sig[0] == '(' and sig[sig.len - 1] == ')') {
+        var inner = sig[1 .. sig.len - 1];
+        var tuple_types = try std.ArrayList([]const u8).initCapacity(allocator, 4);
+        while (inner.len > 0) {
+            const field_sig = nextSingleSig(inner) orelse break;
+            const field_type = try dbusTypeToZig(allocator, field_sig, false);
+            if (std.mem.eql(u8, field_type, "proxy.MethodResult") or std.mem.eql(u8, field_type, "anytype")) {
+                if (is_param) return "anytype";
+                return "proxy.MethodResult";
+            }
+            try tuple_types.append(allocator, field_type);
+            inner = inner[field_sig.len..];
+        }
+
+        if (tuple_types.items.len > 0 and inner.len == 0) {
+            var tuple_buf = try std.ArrayList(u8).initCapacity(allocator, 64);
+            try tuple_buf.appendSlice(allocator, "@Tuple(&[_]type{ ");
+            for (tuple_types.items, 0..) |t, idx| {
+                if (idx > 0) try tuple_buf.appendSlice(allocator, ", ");
+                try tuple_buf.appendSlice(allocator, t);
+            }
+            try tuple_buf.appendSlice(allocator, " })");
+            return tuple_buf.toOwnedSlice(allocator);
+        }
+    }
 
     if (is_param) return "anytype";
     return "proxy.MethodResult";
+}
+
+test "dbusTypeToZig mappings" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try testing.expectEqualStrings("u8", try dbusTypeToZig(alloc, "y", false));
+    try testing.expectEqualStrings("i32", try dbusTypeToZig(alloc, "i", false));
+    try testing.expectEqualStrings("GStr", try dbusTypeToZig(alloc, "s", false));
+    try testing.expectEqualStrings("GPath", try dbusTypeToZig(alloc, "o", false));
+    try testing.expectEqualStrings("GVariant", try dbusTypeToZig(alloc, "v", false));
+
+    // Arrays
+    try testing.expectEqualStrings("[]const GStr", try dbusTypeToZig(alloc, "as", false));
+    try testing.expectEqualStrings("[]const []const u8", try dbusTypeToZig(alloc, "aay", false));
+
+    // Dictionaries
+    try testing.expectEqualStrings("std.StringHashMap(GVariant)", try dbusTypeToZig(alloc, "a{sv}", false));
+    try testing.expectEqualStrings("std.AutoHashMap(u32, u32)", try dbusTypeToZig(alloc, "a{uu}", false));
+    try testing.expectEqualStrings("std.StringHashMap(std.StringHashMap(GVariant))", try dbusTypeToZig(alloc, "a{sa{sv}}", false));
+
+    // Structs / Tuples
+    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, i32 })", try dbusTypeToZig(alloc, "(ii)", false));
+    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, GStr })", try dbusTypeToZig(alloc, "(is)", false));
+    try testing.expectEqualStrings("@Tuple(&[_]type{ GStr, std.StringHashMap(GVariant) })", try dbusTypeToZig(alloc, "(sa{sv})", false));
+    try testing.expectEqualStrings("[]const @Tuple(&[_]type{ i32, GStr })", try dbusTypeToZig(alloc, "a(is)", false));
+    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, @Tuple(&[_]type{ GStr, GStr }) })", try dbusTypeToZig(alloc, "(i(ss))", false));
+
+    // Unrecognized fallbacks
+    try testing.expectEqualStrings("anytype", try dbusTypeToZig(alloc, "z", true));
+    try testing.expectEqualStrings("proxy.MethodResult", try dbusTypeToZig(alloc, "z", false));
 }

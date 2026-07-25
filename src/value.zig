@@ -852,9 +852,9 @@ test "Signature Generation test" {
 
     const TTag = enum { oneValue, twoValue, threeValue };
     const MulTup = union(TTag) {
-        oneValue: std.meta.Tuple(&[_]type{i32}),
-        twoValue: std.meta.Tuple(&[_]type{ i32, i32 }),
-        threeValue: std.meta.Tuple(&[_]type{ i32, i32, i32 }),
+        oneValue: @Tuple(&[_]type{i32}),
+        twoValue: @Tuple(&[_]type{ i32, i32 }),
+        threeValue: @Tuple(&[_]type{ i32, i32, i32 }),
     };
 
     const a = Value.Bool().new(false);
@@ -882,7 +882,7 @@ test "Signature Generation test" {
     const cx = Value.Array(Coord).new(&[_]Coord{coord});
     try testing.expect(eql(u8, cx.repr, "a(dd(dtb))"));
 
-    const tup = Value.Tuple(std.meta.Tuple(&[_]type{ f64, f64, f64 })).new(.{ 4, 4, 4 });
+    const tup = Value.Tuple(@Tuple(&[_]type{ f64, f64, f64 })).new(.{ 4, 4, 4 });
     try testing.expect(eql(u8, tup.repr, "ddd"));
 
     const va = Value.Variant(MulTup).new(.{ .threeValue = .{ 4, 4, 4 } });

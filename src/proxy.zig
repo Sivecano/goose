@@ -32,6 +32,13 @@ pub const MethodResult = struct {
         var dec = self.reader();
         return try dec.decode(T);
     }
+
+    /// Convenience method to decode and deep-copy a value of type T from the reply body.
+    /// The memory is allocated using the connection's allocator and outlives the MethodResult.
+    pub fn expectAlloc(self: *MethodResult, comptime T: type) !T {
+        var dec = BodyDecoder.fromMessage(self.conn.__allocator, self.msg);
+        return try dec.decodeAlloc(T);
+    }
 };
 
 /// A local representation of a remote D-Bus object.
