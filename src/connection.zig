@@ -718,6 +718,7 @@ pub const Connection = struct {
                 .header_fields = try fields_list.toOwnedSlice(self.__allocator),
             },
             .body = body,
+            .allocator = self.__allocator,
         };
     }
 

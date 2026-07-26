@@ -294,12 +294,14 @@ pub const MessageHeader = struct {
 pub const Message = struct {
     header: MessageHeader,
     body: []const u8,
+    allocator: ?std.mem.Allocator = null,
 
     /// Creates a new Message.
     pub fn new(header: MessageHeader, body: []const u8) Message {
         return Message{
             .header = header,
             .body = body,
+            .allocator = null,
         };
     }
 

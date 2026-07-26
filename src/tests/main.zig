@@ -7,9 +7,11 @@ const proxy = goose.proxy;
 const Value = core.value.Value;
 const GStr = core.value.GStr;
 const GPath = core.value.GPath;
+const GVariant = core.value.GVariant;
 const Connection = goose.Connection;
 
 const UPowerProxy = @import("batteries.zig").UPowerProxy;
+const PropertiesProxy = @import("batteries.zig").PropertiesProxy;
 
 fn printData(data: []const u8) void {
     for (data) |x| {
@@ -22,39 +24,25 @@ fn printData(data: []const u8) void {
     std.debug.print("\n", .{});
 }
 
-// Signal handler callback
-// fn onPropertiesChanged(ctx: ?*anyopaque, msg: core.Message) void {
-//     const allocator: std.mem.Allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(ctx orelse return))).*;
-//
-//     const PropValue = union(enum) {
-//         String: GStr,
-//         Bool: bool,
-//         Uint32: u32,
-//         Int32: i32,
-//         Double: f64,
-//     };
-//     const ChangedProp = struct { key: GStr, value: PropValue };
-//
-//     var decoder = message.BodyDecoder.fromMessage(allocator, msg);
-//
-//     const interface_name = decoder.decode(GStr) catch return;
-//     const changed_props = decoder.decode([]const ChangedProp) catch return;
-//     defer allocator.free(changed_props);
-//     const invalidated_props = decoder.decode([]const GStr) catch return;
-//     defer allocator.free(invalidated_props);
-//
-//     std.debug.print("SIGNAL [Callback]: PropertiesChanged on interface '{s}'\n", .{interface_name.s});
-//     for (changed_props) |prop| {
-//         std.debug.print(" - Changed: {s} = ", .{prop.key.s});
-//         switch (prop.value) {
-//             .String => |s| std.debug.print("'{s}'\n", .{s.s}),
-//             .Bool => |b| std.debug.print("{}\n", .{b}),
-//             .Uint32 => |u| std.debug.print("{d}\n", .{u}),
-//             .Int32 => |i| std.debug.print("{d}\n", .{i}),
-//             .Double => |d| std.debug.print("{d}\n", .{d}),
-//         }
-//     }
-// }
+// Signal handler callbacks for generated proxies
+fn onPropertiesChanged(
+    ctx: *u32,
+    args: @Tuple(&[_]type{ GStr, std.StringHashMap(GVariant), []const GStr }),
+) void {
+    ctx.* += 1;
+    const interface_name = args[0];
+    const changed_props = args[1];
+    std.debug.print("SIGNAL [Typed Callback]: PropertiesChanged on '{s}' (count={d})\n", .{ interface_name.s, ctx.* });
+    var it = changed_props.iterator();
+    while (it.next()) |entry| {
+        std.debug.print("  - {s}\n", .{entry.key_ptr.*});
+    }
+}
+
+fn onDeviceAdded(ctx: *u32, args: @Tuple(&[_]type{GPath})) void {
+    ctx.* += 1;
+    std.debug.print("SIGNAL [Typed Callback]: DeviceAdded at '{s}' (count={d})\n", .{ args[0].s, ctx.* });
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -215,28 +203,25 @@ pub fn main(init: std.process.Init) !void {
         result.deinit();
     }
 
-    // Example 6: Listening to Signals (Callback based)
-    // {
-    //     std.debug.print("\nListening to signals via Dispatcher... (Ctrl+C to quit)\n", .{});
-    //     try conn.addMatch("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'");
-    //
-    //     // Register our callback
-    //     try conn.registerSignalHandler("org.freedesktop.DBus.Properties", "PropertiesChanged", onPropertiesChanged, @ptrCast(@constCast(&allocator)));
-    //
-    //     while (true) {
-    //         var msg = try conn.waitMessage();
-    //         defer conn.freeMessage(&msg);
-    //         // waitMessage automatically dispatches registered handlers.
-    //         // Other messages (like NameAcquired) will be returned here and printed by waitMessage debug.
-    //     }
-    // }
+    // Example 6: Listening to Signals via Generated Proxy Helpers
+    {
+        std.debug.print("\nExample 6: Subscribing to PropertiesChanged via generated proxy helper...\n", .{});
+        var signal_count: u32 = 0;
+        const props = PropertiesProxy.init(&conn);
+        try props.connectPropertiesChanged(&signal_count, onPropertiesChanged);
+        std.debug.print("Successfully subscribed to PropertiesChanged! (handler count={d})\n", .{conn.signal_handlers.items.len});
+    }
 
-    // Example 7: Using Generated proxy
+    // Example 10: Using Generated proxy
     {
         var conn2 = try Connection.init(allocator, .System, init.io, init.environ_map);
         defer conn2.close();
 
         const power = UPowerProxy.init(&conn2);
+        var dev_count: u32 = 0;
+        try power.connectDeviceAdded(&dev_count, onDeviceAdded);
+        std.debug.print("\nExample 10: Subscribed to UPower DeviceAdded signal! (handler count={d})\n", .{conn2.signal_handlers.items.len});
+
         const paths = try power.EnumerateDevices();
 
         for (paths) |path| {

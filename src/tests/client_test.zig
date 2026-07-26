@@ -3,6 +3,11 @@ const goose = @import("goose");
 const proxy = goose.proxy;
 const GStr = goose.core.value.GStr;
 
+fn onSignal(ctx: *u32, args: @Tuple(&[_]type{GStr})) void {
+    ctx.* += 1;
+    std.debug.print("CLIENT RECEIVED SIGNAL: dev.myinterface.test.thisIsAsignal with arg: '{s}' (count={d})\n", .{ args[0].s, ctx.* });
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -14,25 +19,15 @@ pub fn main(init: std.process.Init) !void {
     );
     defer conn.close();
 
-    try conn.addMatch("type='signal',interface='dev.myinterface.test'");
+    const p = proxy.Proxy.init(
+        &conn,
+        "dev.myinterface.test",
+        "/dev/myinterface/test",
+        "dev.myinterface.test",
+    );
 
-    const Handler = struct {
-        fn onSignal(_: ?*anyopaque, msg: goose.core.Message) void {
-            var iface: []const u8 = "unknown";
-            var member: []const u8 = "unknown";
-            for (msg.header.header_fields) |f| {
-                switch (f.value) {
-                    .Interface => |s| iface = s,
-                    .Member => |s| member = s,
-                    else => {},
-                }
-            }
-            std.debug.print("CLIENT RECEIVED SIGNAL: {s}.{s}\n", .{ iface, member });
-        }
-    };
-    try conn.registerSignalHandler("dev.myinterface.test", "thisIsAsignal", Handler.onSignal, null);
-
-    const p = proxy.Proxy.init(&conn, "dev.myinterface.test", "/dev/myinterface/test", "dev.myinterface.test");
+    var signal_count: u32 = 0;
+    try p.connectSignal(@Tuple(&[_]type{GStr}), "thisIsAsignal", &signal_count, onSignal);
 
     // Test Introspection
     std.debug.print("Client: Calling Introspect()...\n", .{});

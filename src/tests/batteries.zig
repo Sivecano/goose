@@ -28,6 +28,13 @@ pub const PropertiesProxy = struct {
         var res = try self.inner.call("Set", .{ interface_name, property_name, value });
         res.deinit();
     }
+    pub fn connectPropertiesChanged(
+        self: PropertiesProxy,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), @Tuple(&[_]type{ GStr, std.StringHashMap(GVariant), []const GStr })) void,
+    ) !void {
+        try self.inner.connectSignal(@Tuple(&[_]type{ GStr, std.StringHashMap(GVariant), []const GStr }), "PropertiesChanged", ctx, callback);
+    }
 };
 
 pub const IntrospectableProxy = struct {
@@ -88,5 +95,19 @@ pub const UPowerProxy = struct {
         var res = try self.inner.call("GetCriticalAction", .{});
         defer res.deinit();
         return res.expectAlloc(GStr);
+    }
+    pub fn connectDeviceAdded(
+        self: UPowerProxy,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), @Tuple(&[_]type{GPath})) void,
+    ) !void {
+        try self.inner.connectSignal(@Tuple(&[_]type{GPath}), "DeviceAdded", ctx, callback);
+    }
+    pub fn connectDeviceRemoved(
+        self: UPowerProxy,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), @Tuple(&[_]type{GPath})) void,
+    ) !void {
+        try self.inner.connectSignal(@Tuple(&[_]type{GPath}), "DeviceRemoved", ctx, callback);
     }
 };

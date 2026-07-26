@@ -130,6 +130,38 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
             try out.appendSlice(allocator, "    }\n");
         }
 
+        for (iface.signals) |signal| {
+            try out.appendSlice(allocator, "    pub fn connect");
+            try out.appendSlice(allocator, signal.name);
+            try out.appendSlice(allocator, "(\n");
+            try out.appendSlice(allocator, "        self: ");
+            try out.appendSlice(allocator, short_name);
+            try out.appendSlice(allocator, "Proxy,\n");
+            try out.appendSlice(allocator, "        ctx: anytype,\n");
+            try out.appendSlice(allocator, "        comptime callback: fn (@TypeOf(ctx), @Tuple(&[_]type{");
+
+            var first = true;
+            for (signal.args) |arg| {
+                if (!first) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, false));
+                first = false;
+            }
+
+            try out.appendSlice(allocator, "})) void,\n    ) !void {\n");
+            try out.appendSlice(allocator, "        try self.inner.connectSignal(@Tuple(&[_]type{");
+
+            first = true;
+            for (signal.args) |arg| {
+                if (!first) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, false));
+                first = false;
+            }
+
+            try out.appendSlice(allocator, "}), \"");
+            try out.appendSlice(allocator, signal.name);
+            try out.appendSlice(allocator, "\", ctx, callback);\n    }\n");
+        }
+
         try out.appendSlice(allocator, "};\n\n");
     }
 
