@@ -11,7 +11,7 @@ Goose is a library written in Zig that provides a native implementation of the D
 - **Pure Zig:** No C dependencies.
 - **Bus Connection:** Support for Session, System, and Accessibility buses.
 - **Method Calls:** Call methods on remote objects easily using Proxies.
-- **Signals:** Subscribe to and handle D-Bus signals.
+- **Signals:** Subscribe to and handle D-Bus signals with zero-boilerplate and type-safe callbacks.
 - **Object Export:** Export local Zig objects to the bus with minimal boilerplate.
 - **Introspection:** Parse and generate D-Bus introspection XML.
 - **Code Generation:** Includes a tool to generate Zig proxy code from introspection XML.
@@ -93,22 +93,28 @@ var result = try p.call("ListNames", .{});
 defer result.deinit();
 
 // Parse the result
-// (Note: Implementation details for parsing specific complex return types may vary)
+const names = try result.expect([]const GStr);
 ```
 
 ### Handling Signals
 
-Register a callback function to handle specific signals.
+Subscribing to D-Bus signals is simple with a proxy:
 
 ```zig
-fn onSignal(_: ?*anyopaque, msg: goose.core.Message) void {
-    std.debug.print("Received signal!\n", .{});
+const GStr = goose.core.value.GStr;
+
+// Step 1 :: Define a strongly-typed callback function
+fn onSignal(ctx: *u32, args: @Tuple(&[_]type{GStr})) void {
+    ctx.* += 1;
+    std.debug.print("Received signal with arg: '{s}' (count={d})\n", .{ args[0].s, ctx.* });
 }
 
-// ... inside main
-try conn.addMatch("type='signal',interface='dev.myinterface.test'");
-try conn.registerSignalHandler("dev.myinterface.test", "MySignal", onSignal, null);
+// Step 2 :: Subscribe via your proxy inside main
+var count: u32 = 0;
+try p.connectSignal(@Tuple(&[_]type{GStr}), "MySignal", &count, onSignal);
 ```
+
+_Generated proxy code creates `connect<signalName>` function automatically with the right type for you._
 
 ### Exporting an Object
 
