@@ -2,22 +2,18 @@ const std = @import("std");
 const introspection = @import("introspection.zig");
 
 /// Generates Zig Proxy source code from a D-Bus Node tree.
-pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[]const u8, path: ?[]const u8) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const temp_alloc = arena.allocator();
-
-    var out = try std.ArrayList(u8).initCapacity(allocator, 2048);
-    errdefer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "const std = @import(\"std\");\n");
-    try out.appendSlice(allocator, "const goose = @import(\"goose\");\n");
-    try out.appendSlice(allocator, "const proxy = goose.proxy;\n");
-    try out.appendSlice(allocator, "const GStr = goose.core.value.GStr;\n");
-    try out.appendSlice(allocator, "const GPath = goose.core.value.GPath;\n");
-    try out.appendSlice(allocator, "const GSig = goose.core.value.GSig;\n");
-    try out.appendSlice(allocator, "const GUFd = goose.core.value.GUFd;\n");
-    try out.appendSlice(allocator, "const GVariant = goose.core.value.GVariant;\n\n");
+pub fn generate(writer: *std.Io.Writer, node: introspection.Node, dest: ?[]const u8, path: ?[]const u8) !void {
+    try writer.writeAll(
+        \\const std = @import("std");
+        \\const goose = @import("goose");
+        \\const proxy = goose.proxy;
+        \\const GStr = goose.core.value.GStr;
+        \\const GPath = goose.core.value.GPath;
+        \\const GSig = goose.core.value.GSig;
+        \\const GUFd = goose.core.value.GUFd;
+        \\const GVariant = goose.core.value.GVariant;
+        \\
+    );
 
     for (node.interfaces) |iface| {
         // Simple name cleaning (e.g. org.freedesktop.DBus -> DBus)
@@ -26,54 +22,53 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
             short_name = iface.name[pos + 1 ..];
         }
 
-        try out.appendSlice(allocator, "pub const ");
-        try out.appendSlice(allocator, short_name);
-        try out.appendSlice(allocator, "Proxy = struct {\n");
-        try out.appendSlice(allocator, "    inner: proxy.Proxy,\n\n");
+        try writer.print(
+            \\pub const {s}Proxy = struct {{
+            \\  inner: proxy.Proxy,
+            \\
+            \\  pub fn init(conn: *goose.Connection
+        , .{short_name});
+        if (dest == null) try writer.writeAll(", dest: [:0]const u8");
+        if (path == null) try writer.writeAll(", path: [:0]const u8");
+        try writer.print(
+            \\) {s}Proxy {{
+            \\      return .{{ .inner = proxy.Proxy.init(conn
+        , .{short_name});
 
-        try out.appendSlice(allocator, "    pub fn init(conn: *goose.Connection");
-        if (dest == null) try out.appendSlice(allocator, ", dest: [:0]const u8");
-        if (path == null) try out.appendSlice(allocator, ", path: [:0]const u8");
-        try out.appendSlice(allocator, ") ");
-        try out.appendSlice(allocator, short_name);
-        try out.appendSlice(allocator, "Proxy {\n");
-        try out.appendSlice(allocator, "        return .{ .inner = proxy.Proxy.init(conn, ");
         if (dest) |d| {
-            try out.print(allocator, "\"{s}\"", .{d});
+            try writer.print(", \"{s}\"", .{d});
         } else {
-            try out.appendSlice(allocator, "dest");
+            try writer.writeAll(", dest");
         }
-        try out.appendSlice(allocator, ", ");
+
         if (path) |p| {
-            try out.print(allocator, "\"{s}\"", .{p});
+            try writer.print(", \"{s}\"", .{p});
         } else {
-            try out.appendSlice(allocator, "path");
+            try writer.writeAll(", path");
         }
-        try out.appendSlice(allocator, ", \"");
-        try out.appendSlice(allocator, iface.name);
-        try out.appendSlice(allocator, "\") };\n");
-        try out.appendSlice(allocator, "    }\n\n");
+
+        try writer.print(
+            \\, "{s}") }};
+            \\}}
+            \\
+            \\
+        , .{iface.name});
 
         for (iface.methods) |method| {
-            try out.appendSlice(allocator, "    pub fn ");
-            try out.appendSlice(allocator, method.name);
-            try out.appendSlice(allocator, "(self: ");
-            try out.appendSlice(allocator, short_name);
-            try out.appendSlice(allocator, "Proxy");
-
+            try writer.print("   pub fn {s}(self: {s}Proxy", .{ method.name, short_name });
             // Generate In args
             var in_idx: usize = 0;
             for (method.args) |arg| {
                 if (std.mem.eql(u8, arg.direction, "in")) {
-                    try out.appendSlice(allocator, ", ");
+                    try writer.writeAll(", ");
                     if (arg.name.len > 0) {
-                        try out.appendSlice(allocator, arg.name);
+                        try writer.writeAll(arg.name);
                     } else {
-                        try out.print(allocator, "arg{d}", .{in_idx});
+                        try writer.print("arg{d}", .{in_idx});
+                        in_idx += 1;
                     }
-                    try out.appendSlice(allocator, ": ");
-                    try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, true));
-                    in_idx += 1;
+                    try writer.writeAll(": ");
+                    try dbusTypeToZig(writer, arg.type, true);
                 }
             }
 
@@ -86,86 +81,81 @@ pub fn generate(allocator: std.mem.Allocator, node: introspection.Node, dest: ?[
                 }
             }
 
-            const out_type = if (out_sig) |s| try dbusTypeToZig(temp_alloc, s, false) else "void";
-            const is_method_result = std.mem.eql(u8, out_type, "proxy.MethodResult");
-
-            try out.appendSlice(allocator, ") !");
-            try out.appendSlice(allocator, out_type);
-            try out.appendSlice(allocator, " {\n");
-
-            if (is_method_result) {
-                try out.appendSlice(allocator, "        const res = try self.inner.call(\"");
+            try writer.writeAll(") !");
+            if (out_sig) |s| {
+                try dbusTypeToZig(writer, s, false);
             } else {
-                try out.appendSlice(allocator, "        var res = try self.inner.call(\"");
+                try writer.writeAll("void");
             }
-            try out.appendSlice(allocator, method.name);
-            try out.appendSlice(allocator, "\", .{");
+
+            try writer.print(
+                \\ {{
+                \\      var res = try self.inner.call("{s}", .{{
+            , .{method.name});
 
             var call_idx: usize = 0;
             var first = true;
             for (method.args) |arg| {
                 if (std.mem.eql(u8, arg.direction, "in")) {
-                    if (!first) try out.appendSlice(allocator, ", ");
+                    if (!first) try writer.writeByte(',');
                     if (arg.name.len > 0) {
-                        try out.appendSlice(allocator, arg.name);
+                        try writer.print(" {s}", .{arg.name});
                     } else {
-                        try out.print(allocator, "arg{d}", .{call_idx});
+                        try writer.print(" arg{d}", .{call_idx});
                     }
                     first = false;
                     call_idx += 1;
                 }
             }
-            try out.appendSlice(allocator, "});\n");
+            try writer.writeAll("});\n");
 
-            if (std.mem.eql(u8, out_type, "void")) {
-                try out.appendSlice(allocator, "        res.deinit();\n");
-            } else if (is_method_result) {
-                try out.appendSlice(allocator, "        return res;\n");
-            } else {
-                try out.appendSlice(allocator, "        defer res.deinit();\n");
-                try out.appendSlice(allocator, "        return res.expectAlloc(");
-                try out.appendSlice(allocator, out_type);
-                try out.appendSlice(allocator, ");\n");
+            try writer.writeAll("      defer res.deinit();\n");
+            if (out_sig) |s| {
+                try writer.writeAll("        return res.expectAlloc(");
+                try dbusTypeToZig(writer, s, false);
+                try writer.writeAll(");\n");
             }
-            try out.appendSlice(allocator, "    }\n");
+            try writer.writeAll("    }\n\n");
         }
 
         for (iface.signals) |signal| {
-            try out.appendSlice(allocator, "    pub fn connect");
-            try out.appendSlice(allocator, signal.name);
-            try out.appendSlice(allocator, "(\n");
-            try out.appendSlice(allocator, "        self: ");
-            try out.appendSlice(allocator, short_name);
-            try out.appendSlice(allocator, "Proxy,\n");
-            try out.appendSlice(allocator, "        ctx: anytype,\n");
-            try out.appendSlice(allocator, "        comptime callback: fn (@TypeOf(ctx), @Tuple(&[_]type{");
-
+            try writer.print(
+                \\    pub fn connect{s}(
+                \\        self: {s}Proxy,
+                \\        ctx: anytype,
+                \\        comptime callback: fn (@TypeOf(ctx), struct{{
+            , .{ signal.name, short_name });
             var first = true;
             for (signal.args) |arg| {
-                if (!first) try out.appendSlice(allocator, ", ");
-                try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, false));
+                if (!first) try writer.writeByte(',');
+                try writer.writeByte(' ');
+                try dbusTypeToZig(writer, arg.type, false);
                 first = false;
             }
 
-            try out.appendSlice(allocator, "})) void,\n    ) !void {\n");
-            try out.appendSlice(allocator, "        try self.inner.connectSignal(@Tuple(&[_]type{");
+            try writer.writeAll(
+                \\}) void,
+                \\  ) !void {
+                \\      try self.inner.connectSignal(struct{
+            );
 
             first = true;
             for (signal.args) |arg| {
-                if (!first) try out.appendSlice(allocator, ", ");
-                try out.appendSlice(allocator, try dbusTypeToZig(temp_alloc, arg.type, false));
+                if (!first) try writer.writeByte(',');
+                try writer.writeByte(' ');
+                try dbusTypeToZig(writer, arg.type, false);
                 first = false;
             }
 
-            try out.appendSlice(allocator, "}), \"");
-            try out.appendSlice(allocator, signal.name);
-            try out.appendSlice(allocator, "\", ctx, callback);\n    }\n");
+            try writer.print(
+                \\}}, "{s}", ctx, callback);
+                \\  }}
+                \\
+            , .{signal.name});
         }
 
-        try out.appendSlice(allocator, "};\n\n");
+        try writer.writeAll("};\n\n");
     }
-
-    return out.toOwnedSlice(allocator);
 }
 
 fn matchBasicType(sig: []const u8) ?[]const u8 {
@@ -216,66 +206,59 @@ fn nextSingleSig(sig: []const u8) ?[]const u8 {
     }
 }
 
-fn dbusTypeToZig(allocator: std.mem.Allocator, sig: []const u8, is_param: bool) ![]const u8 {
+fn dbusTypeToZig(writer: *std.Io.Writer, sig: []const u8, is_param: bool) !void {
     if (matchBasicType(sig)) |basic| {
-        return basic;
+        return writer.writeAll(basic);
     }
 
     // Dictionaries: a{kv}
     if (sig.len >= 4 and std.mem.startsWith(u8, sig, "a{") and sig[sig.len - 1] == '}') {
         const key_char = sig[2];
         const val_sig = sig[3 .. sig.len - 1];
-        const val_type = try dbusTypeToZig(allocator, val_sig, false);
-
-        const key_type = matchBasicType(sig[2..3]) orelse "u32";
-
         if (key_char == 's' or key_char == 'o' or key_char == 'g') {
-            return try std.fmt.allocPrint(allocator, "std.StringHashMap({s})", .{val_type});
+            try writer.writeAll("std.StringHashMap(");
         } else {
-            return try std.fmt.allocPrint(allocator, "std.AutoHashMap({s}, {s})", .{ key_type, val_type });
+            try writer.print("std.AutoHashMap({s}, ", .{matchBasicType(sig[2..3]) orelse "u32"});
         }
+
+        try dbusTypeToZig(writer, val_sig, false);
+        return writer.writeByte(')');
     }
 
     // Arrays: a... (excluding dictionaries handled above)
     if (std.mem.startsWith(u8, sig, "a")) {
         const child_sig = sig[1..];
-        const child_type = try dbusTypeToZig(allocator, child_sig, false);
-        if (std.mem.eql(u8, child_type, "proxy.MethodResult") or std.mem.eql(u8, child_type, "anytype")) {
-            if (is_param) return "anytype";
-            return "proxy.MethodResult";
-        }
-        return try std.fmt.allocPrint(allocator, "[]const {s}", .{child_type});
+        try writer.writeAll("[]const ");
+        return dbusTypeToZig(writer, child_sig, false);
     }
 
     // Structs / Tuples: (...)
     if (sig.len >= 2 and sig[0] == '(' and sig[sig.len - 1] == ')') {
         var inner = sig[1 .. sig.len - 1];
-        var tuple_types = try std.ArrayList([]const u8).initCapacity(allocator, 4);
+        try writer.writeAll("struct{ ");
+        var fst: bool = true;
         while (inner.len > 0) {
+            if (!fst) try writer.writeAll(", ");
             const field_sig = nextSingleSig(inner) orelse break;
-            const field_type = try dbusTypeToZig(allocator, field_sig, false);
-            if (std.mem.eql(u8, field_type, "proxy.MethodResult") or std.mem.eql(u8, field_type, "anytype")) {
-                if (is_param) return "anytype";
-                return "proxy.MethodResult";
-            }
-            try tuple_types.append(allocator, field_type);
+            try dbusTypeToZig(writer, field_sig, is_param);
             inner = inner[field_sig.len..];
+            fst = false;
         }
-
-        if (tuple_types.items.len > 0 and inner.len == 0) {
-            var tuple_buf = try std.ArrayList(u8).initCapacity(allocator, 64);
-            try tuple_buf.appendSlice(allocator, "@Tuple(&[_]type{ ");
-            for (tuple_types.items, 0..) |t, idx| {
-                if (idx > 0) try tuple_buf.appendSlice(allocator, ", ");
-                try tuple_buf.appendSlice(allocator, t);
-            }
-            try tuple_buf.appendSlice(allocator, " })");
-            return tuple_buf.toOwnedSlice(allocator);
-        }
+        if (inner.len > 0) return error.InvalidType;
+        try writer.writeAll(" }");
+        return;
     }
 
-    if (is_param) return "anytype";
-    return "proxy.MethodResult";
+    return error.InvalidType;
+}
+
+fn dbusTypeToZigAlloc(allocator: std.mem.Allocator, sig: []const u8, is_param: bool) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+
+    try dbusTypeToZig(&writer.writer, sig, is_param);
+
+    return writer.toOwnedSlice();
 }
 
 test "dbusTypeToZig mappings" {
@@ -284,29 +267,29 @@ test "dbusTypeToZig mappings" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try testing.expectEqualStrings("u8", try dbusTypeToZig(alloc, "y", false));
-    try testing.expectEqualStrings("i32", try dbusTypeToZig(alloc, "i", false));
-    try testing.expectEqualStrings("GStr", try dbusTypeToZig(alloc, "s", false));
-    try testing.expectEqualStrings("GPath", try dbusTypeToZig(alloc, "o", false));
-    try testing.expectEqualStrings("GVariant", try dbusTypeToZig(alloc, "v", false));
+    try testing.expectEqualStrings("u8", try dbusTypeToZigAlloc(alloc, "y", false));
+    try testing.expectEqualStrings("i32", try dbusTypeToZigAlloc(alloc, "i", false));
+    try testing.expectEqualStrings("GStr", try dbusTypeToZigAlloc(alloc, "s", false));
+    try testing.expectEqualStrings("GPath", try dbusTypeToZigAlloc(alloc, "o", false));
+    try testing.expectEqualStrings("GVariant", try dbusTypeToZigAlloc(alloc, "v", false));
 
     // Arrays
-    try testing.expectEqualStrings("[]const GStr", try dbusTypeToZig(alloc, "as", false));
-    try testing.expectEqualStrings("[]const []const u8", try dbusTypeToZig(alloc, "aay", false));
+    try testing.expectEqualStrings("[]const GStr", try dbusTypeToZigAlloc(alloc, "as", false));
+    try testing.expectEqualStrings("[]const []const u8", try dbusTypeToZigAlloc(alloc, "aay", false));
 
     // Dictionaries
-    try testing.expectEqualStrings("std.StringHashMap(GVariant)", try dbusTypeToZig(alloc, "a{sv}", false));
-    try testing.expectEqualStrings("std.AutoHashMap(u32, u32)", try dbusTypeToZig(alloc, "a{uu}", false));
-    try testing.expectEqualStrings("std.StringHashMap(std.StringHashMap(GVariant))", try dbusTypeToZig(alloc, "a{sa{sv}}", false));
+    try testing.expectEqualStrings("std.StringHashMap(GVariant)", try dbusTypeToZigAlloc(alloc, "a{sv}", false));
+    try testing.expectEqualStrings("std.AutoHashMap(u32, u32)", try dbusTypeToZigAlloc(alloc, "a{uu}", false));
+    try testing.expectEqualStrings("std.StringHashMap(std.StringHashMap(GVariant))", try dbusTypeToZigAlloc(alloc, "a{sa{sv}}", false));
 
     // Structs / Tuples
-    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, i32 })", try dbusTypeToZig(alloc, "(ii)", false));
-    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, GStr })", try dbusTypeToZig(alloc, "(is)", false));
-    try testing.expectEqualStrings("@Tuple(&[_]type{ GStr, std.StringHashMap(GVariant) })", try dbusTypeToZig(alloc, "(sa{sv})", false));
-    try testing.expectEqualStrings("[]const @Tuple(&[_]type{ i32, GStr })", try dbusTypeToZig(alloc, "a(is)", false));
-    try testing.expectEqualStrings("@Tuple(&[_]type{ i32, @Tuple(&[_]type{ GStr, GStr }) })", try dbusTypeToZig(alloc, "(i(ss))", false));
+    try testing.expectEqualStrings("struct{ i32, i32 }", try dbusTypeToZigAlloc(alloc, "(ii)", false));
+    try testing.expectEqualStrings("struct{ i32, GStr }", try dbusTypeToZigAlloc(alloc, "(is)", false));
+    try testing.expectEqualStrings("struct{ GStr, std.StringHashMap(GVariant) }", try dbusTypeToZigAlloc(alloc, "(sa{sv})", false));
+    try testing.expectEqualStrings("[]const struct{ i32, GStr }", try dbusTypeToZigAlloc(alloc, "a(is)", false));
+    try testing.expectEqualStrings("struct{ i32, struct{ GStr, GStr } }", try dbusTypeToZigAlloc(alloc, "(i(ss))", false));
 
     // Unrecognized fallbacks
-    try testing.expectEqualStrings("anytype", try dbusTypeToZig(alloc, "z", true));
-    try testing.expectEqualStrings("proxy.MethodResult", try dbusTypeToZig(alloc, "z", false));
+    try testing.expectError(error.InvalidType, dbusTypeToZigAlloc(alloc, "z", true));
+    try testing.expectError(error.InvalidType, dbusTypeToZigAlloc(alloc, "z", false));
 }

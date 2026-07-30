@@ -35,8 +35,9 @@ pub fn main(init: std.process.Init) !void {
     const node = try goose.introspection.parse(allocator, xml.s);
     defer node.deinit(allocator);
 
-    const generated = try goose.generator.generate(allocator, node, dest, path);
-    defer allocator.free(generated);
+    var writer = std.Io.File.stdout().writerStreaming(init.io, try allocator.alloc(u8, 0x100));
+    defer allocator.free(writer.interface.buffer);
 
-    try std.Io.File.stdout().writeStreamingAll(init.io, generated);
+    try goose.generator.generate(&writer.interface, node, dest, path);
+    try writer.flush();
 }
